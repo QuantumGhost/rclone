@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 
+	"github.com/ncw/rclone/fs"
+	"github.com/ncw/rclone/lib/mmap"
 	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
 )
@@ -14,11 +16,8 @@ const (
 	// BufferSize is the default size of the async buffer
 	BufferSize       = 1024 * 1024
 	softStartInitial = 4 * 1024
+	bufferCacheSize  = 1 // number of buffers to keep permanently
 )
-
-var asyncBufferPool = sync.Pool{
-	New: func() interface{} { return newBuffer() },
-}
 
 var errorStreamAbandoned = errors.New("stream abandoned")
 
@@ -82,6 +81,11 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 			select {
 			case <-a.token:
 				b := a.getBuffer()
+				if b == nil {
+					// no buffer allocated
+					// drop the token and continue
+					continue
+				}
 				if a.size < BufferSize {
 					b.buf = b.buf[:a.size]
 					a.size <<= 1
@@ -100,14 +104,12 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 
 // return the buffer to the pool (clearing it)
 func (a *AsyncReader) putBuffer(b *buffer) {
-	b.clear()
-	asyncBufferPool.Put(b)
+	b.free()
 }
 
 // get a buffer from the pool
 func (a *AsyncReader) getBuffer() *buffer {
-	b := asyncBufferPool.Get().(*buffer)
-	return b
+	return newBuffer()
 }
 
 // Read will return the next available data.
@@ -290,14 +292,29 @@ func (a *AsyncReader) Close() (err error) {
 // If an error is present, it must be returned
 // once all buffer content has been served.
 type buffer struct {
+	mem    []byte
 	buf    []byte
 	err    error
 	offset int
 }
 
+// Store buffers for re-use
+var bufferCache = make(chan *buffer, bufferCacheSize)
+
 func newBuffer() *buffer {
+	select {
+	case b := <-bufferCache:
+		return b
+	default:
+	}
+	mem, err := mmap.Alloc(BufferSize)
+	if err != nil {
+		fs.Errorf(nil, "Failed to allocate memory: %v", err)
+		return nil
+	}
 	return &buffer{
-		buf: make([]byte, BufferSize),
+		mem: mem,
+		buf: mem,
 		err: nil,
 	}
 }
@@ -307,6 +324,22 @@ func (b *buffer) clear() {
 	b.buf = b.buf[:cap(b.buf)]
 	b.err = nil
 	b.offset = 0
+}
+
+// free returns the buffer to the OS
+func (b *buffer) free() {
+	b.clear()
+	select {
+	case bufferCache <- b:
+		return
+	default:
+	}
+	err := mmap.Free(b.mem)
+	if err != nil {
+		fs.Errorf(nil, "Failed to free memory: %v", err)
+	}
+	b.mem = nil
+	b.buf = nil
 }
 
 // isEmpty returns true is offset is at end of
